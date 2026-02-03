@@ -141,7 +141,9 @@ def parse_schedule_from_text(text: str) -> dict:
     text = text.split("Години відсутності електропостачання", 1)[1]
 
     for line in text.splitlines():
-        m = re.match(r'(\d)\.(\d)\s+(.+)', line.strip())
+        #m = re.match(r'(\d)\.(\d)\s+(.+)', line.strip())
+        # Змінено, щоб дозволити двокрапку або пробіл після номера групи
+        m = re.match(r'(\d)\.(\d)[:\s]*\s*(.+)', line.strip())
         if not m:
             continue
 
