@@ -49,6 +49,9 @@ def time_to_hour(hhmm: str) -> float:
     return h + m / 60.0
 
 
+
+
+
 def is_schedule_post(text: str) -> bool:
     return any(k.lower() in text.lower() for k in KEYWORDS)
 
@@ -164,7 +167,26 @@ def parse_schedule_from_text(text: str) -> dict:
         log_group_intervals(group_id, intervals)
 
         for t1, t2 in intervals:
-            put_interval(result, group_id, time_to_hour(t1), time_to_hour(t2))
+            #t1h = time_to_hour(t1)
+            #t2h = time_to_hour(t2)
+#
+            ## якщо інтервал переходить через північ
+            #if t2h <= t1h:
+            #    t2h += 24
+            #
+            #put_interval(result, group_id, t1h, t2h)
+            t1h = time_to_hour(t1)
+            t2h = time_to_hour(t2)
+
+            # якщо кінець = 00:00 і початок > 0 — це кінець доби
+            if t2h == 0 and t1h > 0:
+                t2h = 24.0
+
+            # якщо інтервал переходить через північ (22:00 – 02:00)
+            elif t2h < t1h:
+                t2h += 24
+
+            put_interval(result, group_id, t1h, t2h)
 
     return result
 

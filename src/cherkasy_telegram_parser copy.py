@@ -5,10 +5,12 @@
 import asyncio
 import re
 import json
-from datetime import datetime, date, timedelta
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from playwright.async_api import async_playwright
 import os
+
+# ================== НАЛАШТУВАННЯ ==================
 
 TZ = ZoneInfo("Europe/Kyiv")
 URL = "https://t.me/s/pat_cherkasyoblenergo"
@@ -20,273 +22,251 @@ FULL_LOG_FILE = os.path.join(LOG_DIR, "full_log.log")
 os.makedirs(LOG_DIR, exist_ok=True)
 os.makedirs("out", exist_ok=True)
 
+KEYWORDS = [
+    "графіки погодинних відключень",
+    "графіки погодинних вимкнень",
+    "графік погодинних відключень",
+    "графік погодинних вимкнень",
+    "ГПВ",
+    "години відсутності електропостачання",
+    "застосовуватимуться графіки",
+    "оновлений графік"
+]
+
+# ================== ЛОГУВАННЯ ==================
 
 def log(message: str):
-    timestamp = datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S")
-    line = f"{timestamp} [cherkasy_parser] {message}"
+    ts = datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S")
+    line = f"{ts} [cherkasy_parser] {message}"
     print(line)
     with open(FULL_LOG_FILE, "a", encoding="utf-8") as f:
         f.write(line + "\n")
 
+# ================== HELPERS ==================
 
 def time_to_hour(hhmm: str) -> float:
-    hh, mm = map(int, hhmm.split(":"))
-    return hh + (mm / 60.0)
+    h, m = map(int, hhmm.split(":"))
+    return h + m / 60.0
 
 
-async def fetch_text() -> str:
+def is_schedule_post(text: str) -> bool:
+    return any(k.lower() in text.lower() for k in KEYWORDS)
+
+
+def is_update_post(text: str) -> bool:
+    return any(k in text.lower() for k in [
+        "оновлений графік",
+        "оновлено графік",
+        "скорегований графік"
+    ])
+
+
+def log_group_intervals(group_id: str, intervals: list[tuple[str, str]]):
+    if intervals:
+        log(f"✔️ {group_id} — {intervals}")
+
+# ================== TELEGRAM ==================
+
+async def fetch_posts() -> list:
     async with async_playwright() as p:
         browser = await p.chromium.launch(
-            headless=True, 
-            args=[
-                "--no-sandbox",
-                "--disable-setuid-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-blink-features=AutomationControlled"
-            ]
+            headless=True,
+            args=["--no-sandbox", "--disable-dev-shm-usage"]
         )
-        context = await browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        )
-        page = await context.new_page()
-        
-        try:
-            log(f"🌐 Завантажую {URL}...")
-            await page.goto(URL, wait_until="domcontentloaded", timeout=60000)
-            await page.wait_for_selector(".tgme_widget_message", timeout=30000)
-            
-            # Чекаємо додатково для рендерингу контенту
-            await page.wait_for_timeout(3000)
-            
-            text = await page.inner_text("body")
-            log(f"✔️ Отримано {len(text)} символів тексту")
-        finally:
-            await browser.close()
-            
-        return text
+        page = await browser.new_page()
+        await page.goto(URL, timeout=60000)
+        await page.wait_for_selector(".tgme_widget_message")
+        await page.wait_for_timeout(3000)
 
-
-def put_interval(result: dict, group_id: str, t1: float, t2: float) -> None:
-    # Зсув на +1 годину
-    t1 += 1.0
-    t2 += 1.0
-    
-    for hour in range(1, 25):
-        h_start = float(hour)
-        h_mid = h_start + 0.5
-        h_end = h_start + 1.0
-
-        first_off = (t1 < h_mid and t2 > h_start)
-        second_off = (t1 < h_end and t2 > h_mid)
-
-        if not first_off and not second_off:
-            continue
-
-        key = str(hour)
-
-        if first_off and second_off:
-            result[group_id][key] = "no"
-        elif first_off:
-            result[group_id][key] = "first"
-        elif second_off:
-            result[group_id][key] = "second"
-
-
-def parse_schedule_block(text: str, date_str: str) -> dict:
-    """Парсить блок з графіком відключень"""
-    result = {}
-    
-    # Шукаємо текст після "Години відсутності електропостачання"
-    schedule_start = re.search(r'Години\s+відсутності\s+електропостачання', text, re.IGNORECASE)
-    if schedule_start:
-        text = text[schedule_start.end():]
-        log(f"📍 Знайдено початок графіків для {date_str}")
-    
-    # Обрізаємо до наступного поста (шукаємо дату іншого дня або "Перелік адрес")
-    cutoff = re.search(r'(Перелік адрес|Зверніть увагу|Сторінка у Telegram)', text, re.IGNORECASE)
-    if cutoff:
-        text = text[:cutoff.start()]
-        log(f"✂️ Обрізано текст до кінця графіків")
-    
-    lines = text.split('\n')
-    for line in lines:
-        line = line.strip()
-        
-        # Шукаємо формат "1.1 00:00 - 02:00, 08:00 - 10:00"
-        match = re.match(r'(\d)\.(\d)\s+(.+)', line)
-        if not match:
-            continue
-            
-        group_num = f"{match.group(1)}.{match.group(2)}"
-        group_id = "GPV" + group_num
-        text_content = match.group(3)
-        
-        # Перевіряємо чи не вимикається
-        if 'не вимикається' in text_content.lower() or 'не вимикаються' in text_content.lower():
-            log(f"⚪ {group_id} — не вимикається")
-            continue
-        
-        if group_id not in result:
-            result[group_id] = {str(h): "yes" for h in range(1, 25)}
-
-        # Шукаємо інтервали відключень
-        intervals = re.findall(r'(\d{1,2}:\d{2})\s*[-–—]\s*(\d{1,2}:\d{2})', text_content)
-        
-        for t1_str, t2_str in intervals:
-            try:
-                t1 = time_to_hour(t1_str)
-                t2 = time_to_hour(t2_str)
-                put_interval(result, group_id, t1, t2)
-            except:
+        posts = []
+        for msg in await page.query_selector_all(".tgme_widget_message"):
+            text_el = await msg.query_selector(".tgme_widget_message_text")
+            if not text_el:
                 continue
-        
-        if intervals:
-            log(f"✔️ {group_id} — {intervals}")
-    
-    return result
 
+            text = await text_el.inner_text()
+            if is_schedule_post(text):
+                posts.append({"text": text})
 
-async def main():
-    log("⏳ Завантажую Telegram-канал...")
-    html_text = await fetch_text()
-    log("✔️ Текст отримано!")
+        await browser.close()
+        log(f"✔️ Знайдено {len(posts)} постів з графіками")
+        return posts
 
-    today = datetime.now(TZ).date()
-    tomorrow = today + timedelta(days=1)
-    today_str = today.strftime("%d.%m.%Y")
-    tomorrow_str = tomorrow.strftime("%d.%m.%Y")
+# ================== ДАТА ==================
 
-    results_for_all_dates = {}
-    updates_for_dates = {}
-    processed_dates = set()
-
+def extract_date_from_post(text: str) -> str | None:
     months = {
         'січня': '01', 'лютого': '02', 'березня': '03', 'квітня': '04',
         'травня': '05', 'червня': '06', 'липня': '07', 'серпня': '08',
         'вересня': '09', 'жовтня': '10', 'листопада': '11', 'грудня': '12'
     }
-    
-    # Патерн для пошуку дати в пості
-    # "17 грудня за командою НЕК «Укренерго» застосовуватимуться графіки"
-    date_pattern = r'(\d{1,2})\s+(' + '|'.join(months.keys()) + r')\s+за\s+командою\s+НЕК'
-    
-    for match in re.finditer(date_pattern, html_text, re.IGNORECASE):
-        day = match.group(1).zfill(2)
-        month_name = match.group(2).lower()
-        month = months.get(month_name)
-        
-        if not month:
-            continue
-        
-        date_str = f"{day}.{month}.{datetime.now(TZ).year}"
-        
-        # Пропускаємо якщо не today/tomorrow
-        if date_str not in (today_str, tomorrow_str):
-            log(f"⏭️ Пропускаю {date_str} (не сьогодні/завтра)")
-            continue
-        
-        # Пропускаємо якщо вже оброблено
-        if date_str in processed_dates:
-            log(f"ℹ️ {date_str} — вже оброблено, пропускаю")
-            continue
-        
-        log(f"📅 Обробляю пост для {date_str}")
-        
-        # Витягуємо блок поста (шукаємо від початку до наступної дати або кінця)
-        match_start = match.start()
-        
-        # Шукаємо початок поста (зазвичай перед датою є текст про обстріли)
-        post_start = max(0, match_start - 500)
-        
-        # Шукаємо наступну дату
-        next_match = re.search(date_pattern, html_text[match.end():], re.IGNORECASE)
-        
-        if next_match:
-            schedule_block = html_text[post_start:match.end() + next_match.start()]
-        else:
-            schedule_block = html_text[post_start:match.end() + 5000]
-        
-        log(f"📦 Розмір блоку: {len(schedule_block)} символів")
-        
-        # Парсимо графік
-        result = parse_schedule_block(schedule_block, date_str)
-        
-        if not result:
-            log(f"⚠️ Не знайдено графіків для {date_str}")
-            continue
-        
-        # Час оновлення - беремо поточний час
-        current_time = datetime.now(TZ).strftime("%H:%M")
-        updates_for_dates[date_str] = f"{current_time} {date_str}"
-        log(f"🕒 Час оновлення: {current_time}")
-        
-        # Створюємо timestamp
-        day_int, month_int, year_int = map(int, date_str.split("."))
-        date_dt = datetime(year_int, month_int, day_int, tzinfo=TZ)
-        date_ts = int(date_dt.timestamp())
-        
-        results_for_all_dates[str(date_ts)] = result
-        processed_dates.add(date_str)
-        log(f"✅ Додано графік для {date_str}: {len(result)} груп")
 
-    if not results_for_all_dates:
-        log("⚠️ Не знайдено жодних графіків відключень!")
+    for d, m in re.findall(r'(\d{1,2})\s+(%s)' % "|".join(months), text.lower()):
+        return f"{d.zfill(2)}.{months[m]}.{datetime.now(TZ).year}"
+
+    return None
+
+# ================== ПАРСИНГ ==================
+
+def put_interval(result: dict, group_id: str, t1: float, t2: float):
+    # зсув +1 година (GPV-логіка)
+    t1 += 1
+    t2 += 1
+
+    for hour in range(1, 25):
+        h = float(hour)
+
+        first = t1 < h + 0.5 and t2 > h
+        second = t1 < h + 1.0 and t2 > h + 0.5
+
+        if not first and not second:
+            continue
+
+        key = str(hour)
+
+        if first and second:
+            result[group_id][key] = "no"
+        elif first:
+            result[group_id][key] = "first"
+        elif second:
+            result[group_id][key] = "second"
+
+
+def parse_schedule_from_text(text: str) -> dict:
+    result = {}
+
+    if "Години відсутності електропостачання" not in text:
+        return result
+
+    text = text.split("Години відсутності електропостачання", 1)[1]
+
+    for line in text.splitlines():
+        #m = re.match(r'(\d)\.(\d)\s+(.+)', line.strip())
+        # Змінено, щоб дозволити двокрапку або пробіл після номера групи
+        m = re.match(r'(\d)\.(\d)[:\s]*\s*(.+)', line.strip())
+        if not m:
+            continue
+
+        group_id = f"GPV{m.group(1)}.{m.group(2)}"
+        content = m.group(3)
+
+        if "не вимикається" in content.lower():
+            continue
+
+        if group_id not in result:
+            result[group_id] = {}
+
+        intervals = re.findall(
+            r'(\d{1,2}:\d{2})\s*[-–—]\s*(\d{1,2}:\d{2})',
+            content
+        )
+
+        log_group_intervals(group_id, intervals)
+
+        for t1, t2 in intervals:
+            put_interval(result, group_id, time_to_hour(t1), time_to_hour(t2))
+
+    return result
+
+# ================== NORMALIZE ==================
+
+def normalize_schedule(schedule: dict) -> dict:
+    """
+    Гарантує, що кожна група має години 1..24.
+    Якщо години немає — 'yes'.
+    """
+    normalized = {}
+    for group_id, hours in schedule.items():
+        full = {}
+        for h in range(1, 25):
+            key = str(h)
+            full[key] = hours.get(key, "yes")
+        normalized[group_id] = full
+    return normalized
+
+# ================== MERGE ==================
+
+def merge_schedules(base: dict, update: dict) -> dict:
+    merged = {g: h.copy() for g, h in base.items()}
+    for g, hours in update.items():
+        if g not in merged:
+            merged[g] = {}
+        for hour, state in hours.items():
+            merged[g][hour] = state
+    return merged
+
+# ================== MAIN ==================
+
+async def main():
+    posts = await fetch_posts()
+
+    today = datetime.now(TZ).date()
+    tomorrow = today + timedelta(days=1)
+
+    schedules = {}
+
+    for post in posts:
+        date_str = extract_date_from_post(post["text"])
+        if not date_str:
+            continue
+
+        date_obj = datetime.strptime(date_str, "%d.%m.%Y").date()
+        if date_obj not in (today, tomorrow):
+            continue
+
+        parsed = parse_schedule_from_text(post["text"])
+        if not parsed:
+            continue
+
+        if date_str not in schedules:
+            schedules[date_str] = parsed
+            log(f"📅 Базовий графік для {date_str}")
+        elif is_update_post(post["text"]):
+            schedules[date_str] = merge_schedules(schedules[date_str], parsed)
+            log(f"🔄 Оновлення застосовано для {date_str}")
+
+    if not schedules:
+        log("⚠️ Дані не знайдені")
         return False
 
-    # Перевіряємо DIFF
-    if os.path.exists(OUTPUT_FILE):
-        with open(OUTPUT_FILE, "r", encoding="utf-8") as f:
-            old_json = json.load(f)
-        old_data = old_json.get("fact", {}).get("data", {})
+    # -------- формування data --------
+    out_data = {}
+    for d, sch in schedules.items():
+        dt = datetime.strptime(d, "%d.%m.%Y").replace(tzinfo=TZ)
+        out_data[str(int(dt.timestamp()))] = normalize_schedule(sch)
 
-        if json.dumps(old_data, sort_keys=True) == json.dumps(results_for_all_dates, sort_keys=True):
-            log("ℹ️ Дані не змінилися — JSON не оновлюємо")
-            return False
+    out_data = dict(sorted(out_data.items(), key=lambda x: int(x[0])))
 
-    # Вибираємо найновіше оновлення
-    #if updates_for_dates:
-    #    latest_update_value = max(updates_for_dates.values())
-    #    latest_update_formatted = datetime.strptime(
-    #        latest_update_value, "%H:%M %d.%m.%Y"
-    #    ).strftime("%d.%m.%Y %H:%M")
-    #else:
-    #    latest_update_formatted = datetime.now(TZ).strftime("%d.%m.%Y %H:%M")
-    # Встановлюємо поточну дату і час оновлення
-    update_formatted = datetime.now(TZ).strftime("%d.%m.%Y %H:%M")
-    
-    #log(f"🕑 Фінальне оновлення: {latest_update_formatted}")
-    log(f"🕑 Фінальне оновлення (поточні дата і час): {update_formatted}")
-
-    # Сортуємо дати від меншої до більшої
-    sorted_results = dict(sorted(results_for_all_dates.items(), key=lambda x: int(x[0])))
-    results_for_all_dates = sorted_results
-
-    # Формуємо JSON
     new_json = {
         "regionId": "Cherkasy",
         "lastUpdated": datetime.now(ZoneInfo("UTC")).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z",
         "fact": {
-            "data": results_for_all_dates,
-            #"update": latest_update_formatted,
-            "update": update_formatted,
+            "data": out_data,
+            "update": datetime.now(TZ).strftime("%d.%m.%Y %H:%M"),
             "today": int(datetime(today.year, today.month, today.day, tzinfo=TZ).timestamp())
-        },
-        "preset": {
-            "time_zone": {
-                str(i): [f"{i - 1:02d}-{i:02d}", f"{i - 1:02d}:00", f"{i:02d}:00"]
-                for i in range(1, 25)
-            },
-            "time_type": {
-                "yes": "Світло є",
-                "maybe": "Можливе відключення",
-                "no": "Світла немає",
-                "first": "Світла не буде перші 30 хв.",
-                "second": "Світла не буде другі 30 хв"
-            }
         }
     }
 
-    # Записуємо JSON
+    # ================== DIFF CHECK ==================
+    if os.path.exists(OUTPUT_FILE):
+        try:
+            with open(OUTPUT_FILE, "r", encoding="utf-8") as f:
+                old_json = json.load(f)
+
+            if json.dumps(
+                old_json.get("fact", {}).get("data", {}),
+                sort_keys=True
+            ) == json.dumps(
+                new_json.get("fact", {}).get("data", {}),
+                sort_keys=True
+            ):
+                log("ℹ️ Дані не змінилися — JSON не оновлюємо")
+                return False
+
+        except Exception as e:
+            log(f"⚠️ Помилка DIFF-перевірки: {e}")
+
+    # ================== SAVE ==================
     log(f"💾 Записую JSON → {OUTPUT_FILE}")
     with open(OUTPUT_FILE, "w", encoding="utf-8") as f:
         json.dump(new_json, f, ensure_ascii=False, indent=2)
@@ -294,17 +274,24 @@ async def main():
     log("✔️ JSON успішно оновлено")
     return True
 
+# ================== ENTRY ==================
 
 if __name__ == "__main__":
     try:
         result = asyncio.run(main())
         if result:
-            log("🎉 Парсинг завершено успішно")
+            log("🎉 Парсинг завершено з оновленням")
         else:
-            log("ℹ️ Парсинг завершено без оновлень")
+            log("ℹ️ Парсинг завершено без змін")
     except KeyboardInterrupt:
         log("⚠️ Перервано користувачем")
     except Exception as e:
         log(f"❌ Фатальна помилка: {e}")
-        import traceback
-        log(traceback.format_exc())
+        # аварійно видаляємо JSON
+        try:
+            if os.path.exists(OUTPUT_FILE):
+                os.remove(OUTPUT_FILE)
+                log(f"🗑 JSON видалено через помилку: {OUTPUT_FILE}")
+        except Exception:
+            pass
+        raise
